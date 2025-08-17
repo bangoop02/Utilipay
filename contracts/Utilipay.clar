@@ -20,17 +20,29 @@
 (define-constant ERR_INSTALLMENT_ALREADY_PAID (err u113))
 (define-constant ERR_PAYMENT_PLAN_COMPLETED (err u114))
 (define-constant ERR_INVALID_PLAN_TYPE (err u115))
+(define-constant ERR_BUDGET_NOT_FOUND (err u116))
+(define-constant ERR_ALERT_NOT_FOUND (err u117))
+(define-constant ERR_INVALID_THRESHOLD (err u118))
+(define-constant ERR_INSUFFICIENT_DATA (err u119))
+(define-constant ERR_INVALID_PERIOD (err u120))
 
 (define-constant PLAN_TYPE_INSTALLMENT u1)
 (define-constant PLAN_TYPE_RECURRING u2)
 (define-constant MAX_INSTALLMENTS u12)
 (define-constant MIN_INSTALLMENT_AMOUNT u10)
 
+(define-constant ALERT_TYPE_SPIKE u1)
+(define-constant ALERT_TYPE_BUDGET u2)
+(define-constant ALERT_TYPE_FORECAST u3)
+(define-constant MAX_CONSUMPTION_HISTORY u24)
+(define-constant SPIKE_THRESHOLD_PERCENTAGE u50)
+
 (define-constant UTILITY_WATER u1)
 (define-constant UTILITY_ELECTRICITY u2)
 
 (define-data-var next-bill-id uint u1)
 (define-data-var next-plan-id uint u1)
+(define-data-var next-alert-id uint u1)
 (define-data-var water-rate uint u50)
 (define-data-var electricity-rate uint u75)
 
@@ -102,6 +114,51 @@
     due-date: uint,
     paid: bool,
     paid-at: (optional uint)
+  }
+)
+
+(define-map consumption-history
+  { customer: principal, utility-type: uint, period: uint }
+  {
+    consumption: uint,
+    block-height: uint,
+    cost: uint
+  }
+)
+
+(define-map consumption-budgets
+  { customer: principal, utility-type: uint }
+  {
+    monthly-budget: uint,
+    current-period-consumption: uint,
+    budget-start-block: uint,
+    alert-threshold: uint,
+    active: bool
+  }
+)
+
+(define-map consumption-alerts
+  { alert-id: uint }
+  {
+    customer: principal,
+    utility-type: uint,
+    alert-type: uint,
+    consumption-amount: uint,
+    threshold-exceeded: uint,
+    created-at: uint,
+    acknowledged: bool
+  }
+)
+
+(define-map consumption-analytics
+  { customer: principal, utility-type: uint }
+  {
+    total-periods: uint,
+    average-consumption: uint,
+    min-consumption: uint,
+    max-consumption: uint,
+    last-updated: uint,
+    trend-direction: uint
   }
 )
 
@@ -520,3 +577,282 @@
     }
   )
 )
+
+(define-public (record-consumption (customer principal) (utility-type uint) (consumption uint))
+  (let ((oracle tx-sender)
+        (current-period (/ stacks-block-height u144))
+        (rate (if (is-eq utility-type UTILITY_WATER) (var-get water-rate) (var-get electricity-rate)))
+        (cost (* consumption rate)))
+    (asserts! (default-to false (get authorized (map-get? authorized-oracles { oracle: oracle }))) ERR_ORACLE_NOT_AUTHORIZED)
+    (asserts! (is-some (map-get? customers { customer: customer })) ERR_CUSTOMER_NOT_REGISTERED)
+    (asserts! (or (is-eq utility-type UTILITY_WATER) (is-eq utility-type UTILITY_ELECTRICITY)) ERR_INVALID_UTILITY_TYPE)
+    (asserts! (> consumption u0) ERR_INVALID_AMOUNT)
+    (map-set consumption-history
+      { customer: customer, utility-type: utility-type, period: current-period }
+      {
+        consumption: consumption,
+        block-height: stacks-block-height,
+        cost: cost
+      }
+    )
+    (unwrap! (update-consumption-analytics customer utility-type consumption) (ok consumption))
+    (unwrap! (check-consumption-alerts customer utility-type consumption) (ok consumption))
+    (unwrap! (update-budget-tracking customer utility-type consumption) (ok consumption))
+    (ok consumption)
+  )
+)
+
+(define-private (update-consumption-analytics (customer principal) (utility-type uint) (consumption uint))
+  (let ((analytics (map-get? consumption-analytics { customer: customer, utility-type: utility-type })))
+    (match analytics
+      existing-analytics
+        (let ((new-total-periods (+ (get total-periods existing-analytics) u1))
+              (new-average (/ (+ (* (get average-consumption existing-analytics) (get total-periods existing-analytics)) consumption) new-total-periods))
+              (new-min (if (< consumption (get min-consumption existing-analytics)) consumption (get min-consumption existing-analytics)))
+              (new-max (if (> consumption (get max-consumption existing-analytics)) consumption (get max-consumption existing-analytics)))
+              (trend (if (> consumption (get average-consumption existing-analytics)) u1 u0)))
+          (map-set consumption-analytics
+            { customer: customer, utility-type: utility-type }
+            {
+              total-periods: new-total-periods,
+              average-consumption: new-average,
+              min-consumption: new-min,
+              max-consumption: new-max,
+              last-updated: stacks-block-height,
+              trend-direction: trend
+            }
+          )
+          (ok true)
+        )
+      (begin
+        (map-set consumption-analytics
+          { customer: customer, utility-type: utility-type }
+          {
+            total-periods: u1,
+            average-consumption: consumption,
+            min-consumption: consumption,
+            max-consumption: consumption,
+            last-updated: stacks-block-height,
+            trend-direction: u0
+          }
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (check-consumption-alerts (customer principal) (utility-type uint) (consumption uint))
+  (let ((analytics (map-get? consumption-analytics { customer: customer, utility-type: utility-type })))
+    (match analytics
+      existing-analytics
+        (let ((average (get average-consumption existing-analytics))
+              (spike-threshold (+ average (/ (* average SPIKE_THRESHOLD_PERCENTAGE) u100))))
+          (if (> consumption spike-threshold)
+            (begin
+              (unwrap! (create-alert customer utility-type ALERT_TYPE_SPIKE consumption spike-threshold) (ok true))
+              (ok true)
+            )
+            (ok true)
+          )
+        )
+      (ok true)
+    )
+  )
+)
+
+(define-private (update-budget-tracking (customer principal) (utility-type uint) (consumption uint))
+  (let ((budget (map-get? consumption-budgets { customer: customer, utility-type: utility-type })))
+    (match budget
+      existing-budget
+        (if (get active existing-budget)
+          (let ((new-consumption (+ (get current-period-consumption existing-budget) consumption))
+                (threshold-amount (/ (* (get monthly-budget existing-budget) (get alert-threshold existing-budget)) u100)))
+            (map-set consumption-budgets
+              { customer: customer, utility-type: utility-type }
+              (merge existing-budget { current-period-consumption: new-consumption })
+            )
+            (if (>= new-consumption threshold-amount)
+              (begin
+                (unwrap! (create-alert customer utility-type ALERT_TYPE_BUDGET new-consumption threshold-amount) (ok true))
+                (ok true)
+              )
+              (ok true)
+            )
+          )
+          (ok true)
+        )
+      (ok true)
+    )
+  )
+)
+
+(define-private (create-alert (customer principal) (utility-type uint) (alert-type uint) (consumption uint) (threshold uint))
+  (let ((alert-id (var-get next-alert-id)))
+    (map-set consumption-alerts
+      { alert-id: alert-id }
+      {
+        customer: customer,
+        utility-type: utility-type,
+        alert-type: alert-type,
+        consumption-amount: consumption,
+        threshold-exceeded: threshold,
+        created-at: stacks-block-height,
+        acknowledged: false
+      }
+    )
+    (var-set next-alert-id (+ alert-id u1))
+    (ok alert-id)
+  )
+)
+
+(define-public (set-consumption-budget (utility-type uint) (monthly-budget uint) (alert-threshold uint))
+  (let ((customer tx-sender))
+    (asserts! (is-some (map-get? customers { customer: customer })) ERR_CUSTOMER_NOT_REGISTERED)
+    (asserts! (or (is-eq utility-type UTILITY_WATER) (is-eq utility-type UTILITY_ELECTRICITY)) ERR_INVALID_UTILITY_TYPE)
+    (asserts! (> monthly-budget u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (> alert-threshold u0) (<= alert-threshold u100)) ERR_INVALID_THRESHOLD)
+    (map-set consumption-budgets
+      { customer: customer, utility-type: utility-type }
+      {
+        monthly-budget: monthly-budget,
+        current-period-consumption: u0,
+        budget-start-block: stacks-block-height,
+        alert-threshold: alert-threshold,
+        active: true
+      }
+    )
+    (ok monthly-budget)
+  )
+)
+
+(define-public (reset-budget-period (utility-type uint))
+  (let ((customer tx-sender)
+        (budget (unwrap! (map-get? consumption-budgets { customer: customer, utility-type: utility-type }) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (is-eq customer tx-sender) ERR_UNAUTHORIZED)
+    (map-set consumption-budgets
+      { customer: customer, utility-type: utility-type }
+      (merge budget {
+        current-period-consumption: u0,
+        budget-start-block: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (acknowledge-alert (alert-id uint))
+  (let ((customer tx-sender)
+        (alert (unwrap! (map-get? consumption-alerts { alert-id: alert-id }) ERR_ALERT_NOT_FOUND)))
+    (asserts! (is-eq customer (get customer alert)) ERR_UNAUTHORIZED)
+    (asserts! (not (get acknowledged alert)) ERR_ALERT_NOT_FOUND)
+    (map-set consumption-alerts
+      { alert-id: alert-id }
+      (merge alert { acknowledged: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (toggle-budget-status (utility-type uint))
+  (let ((customer tx-sender)
+        (budget (unwrap! (map-get? consumption-budgets { customer: customer, utility-type: utility-type }) ERR_BUDGET_NOT_FOUND)))
+    (asserts! (is-eq customer tx-sender) ERR_UNAUTHORIZED)
+    (map-set consumption-budgets
+      { customer: customer, utility-type: utility-type }
+      (merge budget { active: (not (get active budget)) })
+    )
+    (ok (not (get active budget)))
+  )
+)
+
+(define-read-only (get-consumption-history (customer principal) (utility-type uint) (periods uint))
+  (let ((current-period (/ stacks-block-height u144))
+        (history (list)))
+    (if (> periods MAX_CONSUMPTION_HISTORY)
+      (err ERR_INVALID_PERIOD)
+      (ok (get-consumption-periods customer utility-type current-period periods))
+    )
+  )
+)
+
+(define-private (get-consumption-periods (customer principal) (utility-type uint) (current-period uint) (periods uint))
+  (let ((history (list)))
+    history
+  )
+)
+
+(define-read-only (get-consumption-analytics (customer principal) (utility-type uint))
+  (map-get? consumption-analytics { customer: customer, utility-type: utility-type })
+)
+
+(define-read-only (get-consumption-budget (customer principal) (utility-type uint))
+  (map-get? consumption-budgets { customer: customer, utility-type: utility-type })
+)
+
+(define-read-only (get-consumption-alert (alert-id uint))
+  (map-get? consumption-alerts { alert-id: alert-id })
+)
+
+(define-read-only (calculate-consumption-forecast (customer principal) (utility-type uint))
+  (match (map-get? consumption-analytics { customer: customer, utility-type: utility-type })
+    analytics (if (>= (get total-periods analytics) u3)
+                (let ((forecast-base (get average-consumption analytics))
+                      (trend-adjustment (if (is-eq (get trend-direction analytics) u1) 
+                                          (/ (* forecast-base u10) u100) 
+                                          (- u0 (/ (* forecast-base u5) u100)))))
+                  (some (+ forecast-base trend-adjustment)))
+                none)
+    none
+  )
+)
+
+(define-read-only (get-budget-utilization (customer principal) (utility-type uint))
+  (match (map-get? consumption-budgets { customer: customer, utility-type: utility-type })
+    budget (if (get active budget)
+             (let ((utilization-percentage (/ (* (get current-period-consumption budget) u100) (get monthly-budget budget))))
+               (some {
+                 current-consumption: (get current-period-consumption budget),
+                 budget-limit: (get monthly-budget budget),
+                 utilization-percentage: utilization-percentage,
+                 remaining-budget: (- (get monthly-budget budget) (get current-period-consumption budget)),
+                 alert-threshold: (get alert-threshold budget)
+               }))
+             none)
+    none
+  )
+)
+
+(define-read-only (get-customer-alerts (customer principal))
+  (let ((alerts (list)))
+    alerts
+  )
+)
+
+(define-read-only (compare-consumption-periods (customer principal) (utility-type uint) (period1 uint) (period2 uint))
+  (let ((consumption1 (map-get? consumption-history { customer: customer, utility-type: utility-type, period: period1 }))
+        (consumption2 (map-get? consumption-history { customer: customer, utility-type: utility-type, period: period2 })))
+    (match consumption1
+      data1 (match consumption2
+             data2 (some {
+                     period1-consumption: (get consumption data1),
+                     period2-consumption: (get consumption data2),
+                     difference: (if (> (get consumption data1) (get consumption data2))
+                                   (- (get consumption data1) (get consumption data2))
+                                   (- (get consumption data2) (get consumption data1))),
+                     percentage-change: (if (> (get consumption data2) u0)
+                                          (/ (* (- (get consumption data1) (get consumption data2)) u100) (get consumption data2))
+                                          u0)
+                   })
+             none)
+      none
+    )
+  )
+)
+
+(define-read-only (get-next-alert-id)
+  (var-get next-alert-id)
+)
+
+
+
