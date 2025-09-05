@@ -9,6 +9,11 @@ requirements = []
 path = 'contracts/Utilipay.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.loyalty-rewards]
+path = 'contracts/loyalty-rewards.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
